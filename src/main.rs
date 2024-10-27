@@ -7,7 +7,7 @@ mod tcp;
 
 const IPV4_PROTO: u16 = 0x0800;
 const TCP_PROTO: u8 = 0x0006;
-const TAP_NAME: &str = "tap0";
+const TAP_NAME: &str = "tun0";
 
 /*
  * first we get the IPV4 packet and extract the TCP packet from it
@@ -20,43 +20,59 @@ struct Quad {
 }
 
 fn main() -> Result<(), ()> {
-    let nic = Iface::new(TAP_NAME, tun_tap::Mode::Tun)
+    let mut nic = Iface::without_packet_info(TAP_NAME, tun_tap::Mode::Tun)
         .expect("Grey we failed to create a new TUN Devive");
     let mut buf = [0u8; 1504];
 
-    let mut connections: HashMap<Quad, tcp::State> = Default::default();
+    let mut connections: HashMap<Quad, tcp::Connection> = Default::default();
     loop {
         let nbytes = nic.recv(&mut buf).unwrap();
-        let _flags = u16::from_be_bytes([buf[0], buf[1]]);
-        let eth_proto = u16::from_be_bytes([buf[2], buf[3]]);
+        // let _flags = u16::from_be_bytes([buf[0], buf[1]]);
+        //let eth_proto = u16::from_be_bytes([buf[2], buf[3]]);
+        // if eth_proto != IPV4_PROTO {
+        //     continue;
+        // }
 
-        if eth_proto != IPV4_PROTO {
-            continue;
-        }
-
-        match Ipv4HeaderSlice::from_slice(&buf[4..nbytes]) {
+        match Ipv4HeaderSlice::from_slice(&buf[..nbytes]) {
             Ok(iph) => {
                 if iph.protocol() != IpNumber(TCP_PROTO) {
                     continue;
                 }
-                match TcpHeaderSlice::from_slice(&buf[4 + iph.slice().len()..nbytes]) {
+                match TcpHeaderSlice::from_slice(&buf[iph.slice().len()..nbytes]) {
                     Ok(tcph) => {
-                        let state = connections
-                            .entry(Quad {
-                                src: (iph.source_addr(), tcph.source_port()),
-                                dst: (iph.destination_addr(), tcph.destination_port()),
-                            })
-                            .or_insert(tcp::State {});
-                        let datai = 4 + iph.slice().len() + tcph.slice().len();
-                        state.on_packet(iph, tcph, &buf[datai..nbytes]);
+                        use std::collections::hash_map::Entry;
+                        let datai = iph.slice().len() + tcph.slice().len();
+
+                        match connections.entry(Quad {
+                            src: (iph.source_addr(), tcph.source_port()),
+                            dst: (iph.destination_addr(), tcph.destination_port()),
+                        }) {
+                            Entry::Vacant(v) => {
+                                if let Some(c) = tcp::Connection::accept(
+                                    &mut nic,
+                                    iph,
+                                    tcph,
+                                    &buf[datai..nbytes],
+                                )
+                                .unwrap()
+                                {
+                                    v.insert(c);
+                                };
+                            }
+                            Entry::Occupied(mut c) => {
+                                let _ =
+                                    c.get_mut()
+                                        .on_packet(&mut nic, iph, tcph, &buf[datai..nbytes]);
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("{}", e);
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("Weird Packet {}", e);
+            Err(_e) => {
+                // eprintln!("Weird Packet {}", e);
             }
         }
     }
