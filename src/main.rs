@@ -5,7 +5,7 @@ use tun_tap::Iface;
 
 mod tcp;
 
-const IPV4_PROTO: u16 = 0x0800;
+const _IPV4_PROTO: u16 = 0x0800;
 const TCP_PROTO: u8 = 0x0006;
 const TAP_NAME: &str = "tun0";
 

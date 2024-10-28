@@ -8,6 +8,7 @@ pub struct Connection {
     state: State,
     send: SenderSequenceSpace,
     recv: ReciverSequenceSpace,
+    iph: etherparse::Ipv4Header,
 }
 
 struct SenderSequenceSpace {
@@ -49,7 +50,7 @@ impl Connection {
         }
         let iss = 10;
         let mut buf = [0u8; 1500];
-        let c = Connection {
+        let mut c = Connection {
             state: State::SynRcvd,
             send: SenderSequenceSpace {
                 iss,
@@ -66,9 +67,16 @@ impl Connection {
                 up: false,
                 irs: tcph.sequence_number(),
             },
+            iph: etherparse::Ipv4Header::new(
+                0,
+                64,
+                etherparse::IpNumber::TCP,
+                iph.destination(),
+                iph.source(),
+            )
+            .unwrap(),
         };
 
-        // we build up a tcp header
         let mut tcph_res = etherparse::TcpHeader::new(
             tcph.destination_port(),
             tcph.source_port(),
@@ -76,25 +84,18 @@ impl Connection {
             c.send.wnd,
         );
 
-        let iph_res = etherparse::Ipv4Header::new(
-            tcph_res.header_len().try_into().unwrap(),
-            64,
-            etherparse::IpNumber::TCP,
-            iph.destination(),
-            iph.source(),
-        )
-        .unwrap();
+        c.iph.set_payload_len(tcph_res.header_len() + 0).unwrap();
 
         tcph_res.acknowledgment_number = tcph.sequence_number() + 1;
         tcph_res.syn = true;
         tcph_res.ack = true;
         tcph_res.checksum = tcph_res
-            .calc_checksum_ipv4(&iph_res, &[])
+            .calc_checksum_ipv4(&c.iph, &[])
             .expect("Failed to cal teh check sum");
 
         let nbytes = buf.len() - {
             let mut unwritten = &mut buf[..];
-            iph_res.write(&mut unwritten).unwrap();
+            c.iph.write(&mut unwritten).unwrap();
             tcph_res.write(&mut unwritten).unwrap();
             unwritten.len()
         };
