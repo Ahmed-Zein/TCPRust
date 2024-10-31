@@ -4,6 +4,7 @@ pub enum State {
     SynRcvd,
     Estab,
 }
+
 pub struct Connection {
     state: State,
     send: SenderSequenceSpace,
@@ -11,10 +12,11 @@ pub struct Connection {
     iph: etherparse::Ipv4Header,
 }
 
+#[derive(Debug)]
 struct SenderSequenceSpace {
-    /// send unacknowledged
+    /// The oldest unacknowledged sequence number, which is the beginning of the range of bytes sent but not yet acknowledged by the receiver.
     una: u32,
-    /// send next
+    /// The next sequence number to be sent. This marks the end of the range of bytes that have been sent out.
     nxt: u32,
     /// send window
     wnd: u16,
@@ -27,6 +29,8 @@ struct SenderSequenceSpace {
     /// - initial send sequence number
     iss: u32,
 }
+
+#[derive(Debug)]
 struct ReciverSequenceSpace {
     /// receive next
     nxt: u32,
@@ -62,10 +66,10 @@ impl Connection {
                 up: false,
             },
             recv: ReciverSequenceSpace {
+                irs: tcph.sequence_number(),
                 nxt: tcph.sequence_number() + 1,
                 wnd: tcph.window_size(),
                 up: false,
-                irs: tcph.sequence_number(),
             },
             iph: etherparse::Ipv4Header::new(
                 0,
@@ -80,7 +84,7 @@ impl Connection {
         let mut tcph_res = etherparse::TcpHeader::new(
             tcph.destination_port(),
             tcph.source_port(),
-            c.send.nxt,
+            c.send.iss,
             c.send.wnd,
         );
 
@@ -110,17 +114,85 @@ impl Connection {
         tcph: etherparse::TcpHeaderSlice,
         data: &[u8],
     ) -> std::io::Result<()> {
+        if self.is_ack_valid(tcph.acknowledgment_number()) == false {
+            println!(
+                "Grey! we got an unvalid ACK number,connection: {:?}, ACK: {}",
+                self.send,
+                tcph.acknowledgment_number()
+            );
+            return Ok(());
+        }
+        let mut seq_len = data.len();
+        tcph.syn().then(|| seq_len += 1);
+        tcph.fin().then(|| seq_len += 1);
+        if self.is_seq_valid(tcph.sequence_number(), seq_len as u32) == false {
+            println!(
+                "Grey! we got an unvalid SEQ number,\nconnection: {:?},\nSEQ: {},\nSEQ_LEN: {}",
+                self.recv,
+                tcph.sequence_number(),
+                data.len()
+            );
+            return Ok(());
+        }
+
         match self.state {
             State::SynRcvd => {
-                if tcph.ack() && tcph.sequence_number() == self.recv.nxt {
+                if tcph.ack()
+                    && self.recv.nxt <= tcph.sequence_number()
+                    && tcph.sequence_number() < self.recv.nxt + self.recv.wnd as u32
+                {
                     eprintln!("Grey! we estabed a connection");
                     self.state = State::Estab;
                 }
             }
             State::Estab => {
-                unimplemented!();
+                println!("{:?}", data.to_ascii_lowercase());
+                // unimplemented!();
             }
         }
         Ok(())
+    }
+    fn is_ack_valid(&self, ack: u32) -> bool {
+        if (self.send.una <= self.send.nxt && (ack <= self.send.una || ack > self.send.nxt))
+            || (self.send.una > self.send.nxt && (ack <= self.send.una && ack > self.send.nxt))
+        {
+            return false;
+        }
+        true
+    }
+    /// we have four cases for the acceptability of an incoming segment
+    /// |---------------|-------------------|---------------------------------------------------|
+    /// | Segment Length| Receive Window    | Test                                              |
+    /// |---------------|-------------------|---------------------------------------------------|
+    /// | 0             | 0                 | SEG.SEQ = RCV.NXT                                 |
+    /// |---------------|-------------------|---------------------------------------------------|
+    /// | 0             | >0                | RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND              |
+    /// |---------------|-------------------|---------------------------------------------------|
+    /// |  0>           | 0                 | not acceptable                                    |
+    /// |---------------|-------------------|---------------------------------------------------|
+    /// | >0            | >0                | RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND **or**       |
+    /// |               |                   | or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND |
+    /// |---------------|-------------------|---------------------------------------------------|
+    fn is_seq_valid(&self, seq: u32, seq_len: u32) -> bool {
+        // case 1 and 3
+        if self.recv.wnd == 0 {
+            return seq_len == 0 && seq == self.recv.nxt;
+        }
+
+        let start = self.recv.nxt;
+        let end = start.wrapping_add(self.recv.wnd as u32);
+        let last_seq = seq.wrapping_add(seq_len);
+
+        if (start < end && start <= seq && seq < end) || (end < start && start <= seq && seq < end)
+        {
+            return true;
+        }
+
+        if (start < end && start <= last_seq && seq < end)
+            || (end < start && start <= last_seq && seq < end)
+        {
+            return true;
+        }
+        false
     }
 }
