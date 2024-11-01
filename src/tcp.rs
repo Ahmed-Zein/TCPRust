@@ -10,6 +10,7 @@ pub struct Connection {
     send: SenderSequenceSpace,
     recv: ReciverSequenceSpace,
     iph: etherparse::Ipv4Header,
+    tcph: etherparse::TcpHeader,
 }
 
 #[derive(Debug)]
@@ -52,7 +53,8 @@ impl Connection {
         if !tcph.syn() {
             return Err("syn not exist".to_string());
         }
-        let iss = 10;
+        let iss = 64;
+        let wnd = 10; // TODO: change to something random to follow the RFC
         let mut buf = [0u8; 1500];
         let mut c = Connection {
             state: State::SynRcvd,
@@ -60,7 +62,7 @@ impl Connection {
                 iss,
                 una: iss,
                 nxt: iss + 1,
-                wnd: 10, // TODO: change to something random to follow the RFC
+                wnd,
                 wl1: 0,
                 wl2: 0,
                 up: false,
@@ -79,34 +81,37 @@ impl Connection {
                 iph.source(),
             )
             .unwrap(),
+            tcph: etherparse::TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, wnd),
         };
 
-        let mut tcph_res = etherparse::TcpHeader::new(
-            tcph.destination_port(),
-            tcph.source_port(),
-            c.send.iss,
-            c.send.wnd,
-        );
+        //   let mut tcph_res = etherparse::TcpHeader::new(
+        //       tcph.destination_port(),
+        //       tcph.source_port(),
+        //       c.send.iss,
+        //       c.send.wnd,
+        //   );
 
-        c.iph.set_payload_len(tcph_res.header_len() + 0).unwrap();
-
-        tcph_res.acknowledgment_number = tcph.sequence_number() + 1;
-        tcph_res.syn = true;
-        tcph_res.ack = true;
-        tcph_res.checksum = tcph_res
+        c.tcph.acknowledgment_number = tcph.sequence_number() + 1;
+        c.tcph.syn = true;
+        c.tcph.ack = true;
+        c.tcph.checksum = c
+            .tcph
             .calc_checksum_ipv4(&c.iph, &[])
             .expect("Failed to cal teh check sum");
+
+        c.iph.set_payload_len(c.tcph.header_len() + 0).unwrap();
 
         let nbytes = buf.len() - {
             let mut unwritten = &mut buf[..];
             c.iph.write(&mut unwritten).unwrap();
-            tcph_res.write(&mut unwritten).unwrap();
+            c.tcph.write(&mut unwritten).unwrap();
             unwritten.len()
         };
 
         let _ = nic.send(&buf[..nbytes]);
         Ok(Some(c))
     }
+
     pub fn on_packet(
         &mut self,
         nic: &mut tun_tap::Iface,
@@ -120,8 +125,10 @@ impl Connection {
                 self.send,
                 tcph.acknowledgment_number()
             );
+            // TODO: check if we are not in a syncronized state yet send rst
             return Ok(());
         }
+
         let mut seq_len = data.len();
         tcph.syn().then(|| seq_len += 1);
         tcph.fin().then(|| seq_len += 1);
@@ -137,13 +144,11 @@ impl Connection {
 
         match self.state {
             State::SynRcvd => {
-                if tcph.ack()
-                    && self.recv.nxt <= tcph.sequence_number()
-                    && tcph.sequence_number() < self.recv.nxt + self.recv.wnd as u32
-                {
-                    eprintln!("Grey! we estabed a connection");
-                    self.state = State::Estab;
+                if !tcph.ack() {
+                    return Ok(());
                 }
+                eprintln!("Grey! we estabed a connection");
+                self.state = State::Estab;
             }
             State::Estab => {
                 println!("{:?}", data.to_ascii_lowercase());
@@ -183,16 +188,22 @@ impl Connection {
         let end = start.wrapping_add(self.recv.wnd as u32);
         let last_seq = seq.wrapping_add(seq_len);
 
-        if (start < end && start <= seq && seq < end) || (end < start && start <= seq && seq < end)
-        {
-            return true;
-        }
-
-        if (start < end && start <= last_seq && seq < end)
-            || (end < start && start <= last_seq && seq < end)
+        if wrapped_cmp_lt(start.wrapping_sub(1), last_seq, end)
+            || wrapped_cmp_lt(start.wrapping_sub(1), last_seq, end)
         {
             return true;
         }
         false
     }
+}
+
+/// start < x < end
+fn wrapped_cmp_lt<T>(start: T, x: T, end: T) -> bool
+where
+    T: std::cmp::Ord,
+{
+    if (start < end && start <= x && x < end) || (end < start && start <= x && x < end) {
+        return true;
+    }
+    false
 }
