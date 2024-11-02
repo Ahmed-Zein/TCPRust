@@ -1,9 +1,8 @@
+mod tcp;
 use etherparse::{IpNumber, Ipv4HeaderSlice, TcpHeaderSlice};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use tun_tap::Iface;
-
-mod tcp;
 
 const _IPV4_PROTO: u16 = 0x0800;
 const TCP_PROTO: u8 = 0x0006;

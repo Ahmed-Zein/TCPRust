@@ -1,46 +1,17 @@
-pub enum State {
-    // Closed,
-    // Listen,
-    SynRcvd,
-    Estab,
-}
+mod sequence_space;
+mod state;
+mod tcpheaderinfo;
+
+use sequence_space::{ReciverSequenceSpace, SenderSequenceSpace};
+use state::State;
+use tcpheaderinfo::TcpHeaderInfo;
 
 pub struct Connection {
     state: State,
     send: SenderSequenceSpace,
     recv: ReciverSequenceSpace,
     iph: etherparse::Ipv4Header,
-    tcph: etherparse::TcpHeader,
-}
-
-#[derive(Debug)]
-struct SenderSequenceSpace {
-    /// The oldest unacknowledged sequence number, which is the beginning of the range of bytes sent but not yet acknowledged by the receiver.
-    una: u32,
-    /// The next sequence number to be sent. This marks the end of the range of bytes that have been sent out.
-    nxt: u32,
-    /// send window
-    wnd: u16,
-    /// send urgent pointer
-    up: bool,
-    /// segment sequence number used for last window update
-    wl1: usize,
-    /// segment acknowledgment number used for last window update
-    wl2: usize,
-    /// - initial send sequence number
-    iss: u32,
-}
-
-#[derive(Debug)]
-struct ReciverSequenceSpace {
-    /// receive next
-    nxt: u32,
-    /// receive window
-    wnd: u16,
-    /// receive urgent pointer
-    up: bool,
-    /// initial receive sequence number
-    irs: u32,
+    tcpi: TcpHeaderInfo,
 }
 
 impl Connection {
@@ -81,30 +52,26 @@ impl Connection {
                 iph.source(),
             )
             .unwrap(),
-            tcph: etherparse::TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, wnd),
+            tcpi: TcpHeaderInfo::new(tcph.destination_port(), tcph.source_port(), iss, wnd),
         };
 
-        //   let mut tcph_res = etherparse::TcpHeader::new(
-        //       tcph.destination_port(),
-        //       tcph.source_port(),
-        //       c.send.iss,
-        //       c.send.wnd,
-        //   );
+        // let mut tcph =
+        //     etherparse::TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, wnd);
+        let mut tcph_res = c.tcpi.build();
 
-        c.tcph.acknowledgment_number = tcph.sequence_number() + 1;
-        c.tcph.syn = true;
-        c.tcph.ack = true;
-        c.tcph.checksum = c
-            .tcph
+        tcph_res.acknowledgment_number = tcph.sequence_number() + 1;
+        tcph_res.syn = true;
+        tcph_res.ack = true;
+        tcph_res.checksum = tcph_res
             .calc_checksum_ipv4(&c.iph, &[])
             .expect("Failed to cal teh check sum");
 
-        c.iph.set_payload_len(c.tcph.header_len() + 0).unwrap();
+        c.iph.set_payload_len(tcph_res.header_len() + 0).unwrap();
 
         let nbytes = buf.len() - {
             let mut unwritten = &mut buf[..];
             c.iph.write(&mut unwritten).unwrap();
-            c.tcph.write(&mut unwritten).unwrap();
+            tcph_res.write(&mut unwritten).unwrap();
             unwritten.len()
         };
 
@@ -126,6 +93,10 @@ impl Connection {
                 tcph.acknowledgment_number()
             );
             // TODO: check if we are not in a syncronized state yet send rst
+            //
+            if !self.state.is_state_syncronized() {
+                self.send_rst(nic);
+            }
             return Ok(());
         }
 
@@ -157,6 +128,10 @@ impl Connection {
         }
         Ok(())
     }
+    fn send_rst(&self, nic: &mut tun_tap::Iface) {
+        // let mut tcph = self.tcph.clone();
+        // tcph.rst = true;
+    }
     fn is_ack_valid(&self, ack: u32) -> bool {
         if (self.send.una <= self.send.nxt && (ack <= self.send.una || ack > self.send.nxt))
             || (self.send.una > self.send.nxt && (ack <= self.send.una && ack > self.send.nxt))
@@ -165,8 +140,9 @@ impl Connection {
         }
         true
     }
-    /// we have four cases for the acceptability of an incoming segment
-    /// |---------------|-------------------|---------------------------------------------------|
+
+    ///  We have four cases for the acceptability of an incoming segment:
+    /// ```
     /// | Segment Length| Receive Window    | Test                                              |
     /// |---------------|-------------------|---------------------------------------------------|
     /// | 0             | 0                 | SEG.SEQ = RCV.NXT                                 |
@@ -175,9 +151,10 @@ impl Connection {
     /// |---------------|-------------------|---------------------------------------------------|
     /// |  0>           | 0                 | not acceptable                                    |
     /// |---------------|-------------------|---------------------------------------------------|
-    /// | >0            | >0                | RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND **or**       |
+    /// | >0            | >0                | RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND              |
     /// |               |                   | or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND |
     /// |---------------|-------------------|---------------------------------------------------|
+    ///```
     fn is_seq_valid(&self, seq: u32, seq_len: u32) -> bool {
         // case 1 and 3
         if self.recv.wnd == 0 {
